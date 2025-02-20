@@ -34,8 +34,9 @@ MAX_OVERALL_DRAWDOWN_PERCENT = 10.0
 PARTIAL_CLOSE_RATIO = 0.5
 TRAIN_TIMEFRAMES_DAYS = 365   # 1 year of data
 TOTAL_TRAINING_TIMESTEPS = 500_000
+REWARD_MULTIPLIER = 10.0  # Scale rewards to encourage aggressive profit-taking
 
-# ------------- RSI FUNCTION ---------------------
+# ------------- Technical Indicator Functions ---------------------
 def compute_rsi(series, period=14):
     """
     Compute RSI (Relative Strength Index) on a price series.
@@ -43,24 +44,61 @@ def compute_rsi(series, period=14):
     delta = series.diff()
     gain = delta.clip(lower=0)
     loss = -1 * delta.clip(upper=0)
-
     avg_gain = gain.ewm(com=period - 1, min_periods=period).mean()
     avg_loss = loss.ewm(com=period - 1, min_periods=period).mean()
-
     rs = avg_gain / (avg_loss + 1e-9)
     rsi = 100 - (100 / (1 + rs))
-    return rsi.fillna(50)  # Fill initial NaNs with neutral value
+    return rsi.fillna(50)
+
+def compute_macd(series, fast=12, slow=26, signal=9):
+    """
+    Compute MACD (Moving Average Convergence Divergence) for a price series.
+    Returns the MACD line, signal line, and histogram.
+    """
+    exp1 = series.ewm(span=fast, adjust=False).mean()
+    exp2 = series.ewm(span=slow, adjust=False).mean()
+    macd_line = exp1 - exp2
+    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+    histogram = macd_line - signal_line
+    return macd_line, signal_line, histogram
+
+def compute_atr(df, period=14):
+    """
+    Compute ATR (Average True Range) using high, low, and close prices from a dataframe.
+    """
+    high = df['high']
+    low = df['low']
+    close = df['close']
+    tr1 = high - low
+    tr2 = abs(high - close.shift(1))
+    tr3 = abs(low - close.shift(1))
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    atr = tr.rolling(window=period, min_periods=period).mean()
+    return atr.fillna(method='bfill')
+
+def dynamic_lot_size(current_balance, atr_value, risk_factor=0.01, factor=100):
+    """
+    Determine lot size dynamically based on current balance and ATR value.
+    risk_factor: fraction of the balance to risk per trade.
+    factor: scaling constant to calibrate position size.
+    Ensures a minimum of 1 lot and a maximum of 5 lots.
+    """
+    risk_amount = risk_factor * current_balance
+    lots = risk_amount / (atr_value * factor)
+    lots = max(1.0, lots)
+    lots = min(lots, 5.0)
+    return lots
 
 # ------------- STEP 1: CONNECT TO MT5 -----------
 def initialize_mt5(account_id=None, password=None, server=None):
     """
-    Initialize MetaTrader5 connection. 
+    Initialize MetaTrader5 connection.
     """
     if not mt5.initialize():
         print("MT5 Initialize() failed. Error code =", mt5.last_error())
         return False
     
-    # If you need to log in to a specific account, un-comment and fill in details:
+    # Uncomment and fill in account details if needed:
     # if account_id and password and server:
     #     authorized = mt5.login(account_id, password=password, server=server)
     #     if not authorized:
@@ -88,26 +126,30 @@ def download_data(symbol=SYMBOL, timeframe=mt5.TIMEFRAME_M5, start_days=TRAIN_TI
     df = pd.DataFrame(rates)
     df['time'] = pd.to_datetime(df['time'], unit='s')
     df.rename(columns={'tick_volume':'volume'}, inplace=True)
-    df = df[['time','open','high','low','close','volume']]
+    df = df[['time', 'open', 'high', 'low', 'close', 'volume']]
     df.sort_values('time', inplace=True)
     df.reset_index(drop=True, inplace=True)
     return df
 
-# ------------- STEP 3: GYM ENVIRONMENT ----------
+# ------------- STEP 3: CUSTOM GYM ENVIRONMENT ----------
 class GoldTradingEnv(gym.Env):
     """
     A refined environment for RL-based gold trading on XAUUSDM.
+    
     New Features:
-      - Logging of every step (trade_log) to diagnose model behavior.
-      - Reward as incremental equity change (scaled by initial_balance).
-
-    Observations:
-      [open, high, low, close, volume, rsi, position_size, current_balance, daily_drawdown%, all-time peak, partial_close_flag]
-
+      - Logs each step (trade_log) for in-depth analysis.
+      - Reward is based on incremental equity change scaled by a reward multiplier.
+      - Additional ATR indicator included in observations.
+      - Dynamic position sizing based on ATR and account balance.
+    
+    Observations (13 features):
+      [open, high, low, close, volume, rsi, macd_hist, atr, position_size,
+       current_balance, daily_drawdown%, overall_peak_balance, partial_close_flag]
+    
     Actions (discrete):
       0 = hold
-      1 = open long (1 lot)
-      2 = open short (1 lot)
+      1 = open long
+      2 = open short
       3 = close partial (50%)
       4 = close full
     """
@@ -120,13 +162,14 @@ class GoldTradingEnv(gym.Env):
         self.initial_balance = initial_balance
         self.verbose = verbose
 
-        # Compute RSI
+        # Compute technical indicators
         self.df['rsi'] = compute_rsi(self.df['close'], period=14)
+        macd_line, signal_line, macd_hist = compute_macd(self.df['close'])
+        self.df['macd_hist'] = macd_hist.fillna(0)
+        self.df['atr'] = compute_atr(self.df, period=14)
         
-        # Step pointers
+        # Step pointer and account attributes
         self.current_step = 0
-        
-        # Account attributes
         self.position_size = 0.0
         self.entry_price = 0.0
         self.current_balance = initial_balance
@@ -135,19 +178,18 @@ class GoldTradingEnv(gym.Env):
         self.daily_drawdown_percent = 0.0
         self.overall_peak_balance = initial_balance
         
-        # For partial close
+        # For partial close tracking
         self.partial_close_triggered = False
         
-        # For logging
-        self.trade_log = []          # Will store dicts of step-by-step info
-        self.prev_equity = self.equity  # For incremental reward
+        # For logging trade activity
+        self.trade_log = []          # List of dicts for step-by-step logs
+        self.prev_equity = self.equity  # For incremental reward calculation
 
-        # Observation Space
+        # Define observation and action space (13 features)
         self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(11,), dtype=np.float32
+            low=-np.inf, high=np.inf, shape=(13,), dtype=np.float32
         )
         
-        # Action Space
         self.action_space = spaces.Discrete(5)
     
     def _get_observation(self):
@@ -159,6 +201,8 @@ class GoldTradingEnv(gym.Env):
             row.close,
             row.volume,
             row.rsi,
+            row.macd_hist,
+            row.atr,
             self.position_size,
             self.current_balance,
             self.daily_drawdown_percent,
@@ -186,18 +230,18 @@ class GoldTradingEnv(gym.Env):
     def step(self, action):
         current_price = self.df.iloc[self.current_step].close
         
-        # Record equity before action
+        # Record previous state for reward calculation
         old_equity = self.equity
         old_balance = self.current_balance
         old_position = self.position_size
         
-        # Update equity based on current price
+        # Update equity based on current market price
         self._update_equity(current_price)
 
-        # Execute the chosen action
+        # Execute the selected action
         self._execute_action(action, current_price)
 
-        # Move to next step
+        # Advance to next step
         self.current_step += 1
         done = False
         if self.current_step >= len(self.df) - 1:
@@ -207,21 +251,20 @@ class GoldTradingEnv(gym.Env):
             next_price = self.df.iloc[self.current_step].close
             self._update_equity(next_price)
         
-        # Reward = incremental equity change since last step, scaled by initial_balance
-        reward = (self.equity - self.prev_equity) / self.initial_balance
-        self.prev_equity = self.equity  # update for next step
+        # Reward: incremental equity change scaled by REWARD_MULTIPLIER
+        reward = ((self.equity - self.prev_equity) / self.initial_balance) * REWARD_MULTIPLIER
+        self.prev_equity = self.equity
 
-        # Check daily drawdown
+        # Apply penalties for drawdown violations
         if self._calculate_daily_drawdown() > MAX_DAILY_DRAWDOWN_PERCENT:
-            reward -= 1.0  # penalty
+            reward -= 1.0  # daily drawdown penalty
             done = True
         
-        # Check overall drawdown
         if self._calculate_overall_drawdown() > MAX_OVERALL_DRAWDOWN_PERCENT:
-            reward -= 2.0
+            reward -= 2.0  # overall drawdown penalty
             done = True
 
-        # Construct log for this step
+        # Log step details for analysis
         step_log = {
             "step": self.current_step,
             "action": action,
@@ -238,7 +281,6 @@ class GoldTradingEnv(gym.Env):
         }
         self.trade_log.append(step_log)
 
-        # Optional: Print debug info if verbose
         if self.verbose:
             print(f"[Step {self.current_step}] Action={action}, Price={current_price:.2f}, "
                   f"Equity={self.equity:.2f}, Reward={reward:.4f}, PosSize={self.position_size}")
@@ -249,47 +291,56 @@ class GoldTradingEnv(gym.Env):
         return obs, reward, done, info
 
     def _execute_action(self, action, current_price):
-        """Interpret and execute the chosen action: open/close partial/close full."""
+        """
+        Execute the chosen action: hold, open long/short, close partial/full.
+        """
         if action == 0:
-            # hold
+            # Hold
             pass
         elif action == 1:
-            # open long
+            # Open long: if no position, open a new long position using dynamic lot size.
             if self.position_size == 0:
-                self._open_position(lots=1, direction="long", price=current_price)
+                atr_value = self.df.iloc[self.current_step].atr
+                lots = dynamic_lot_size(self.current_balance, atr_value)
+                self._open_position(lots=lots, direction="long", price=current_price)
         elif action == 2:
-            # open short
+            # Open short: if no position, open a new short position using dynamic lot size.
             if self.position_size == 0:
-                self._open_position(lots=1, direction="short", price=current_price)
+                atr_value = self.df.iloc[self.current_step].atr
+                lots = dynamic_lot_size(self.current_balance, atr_value)
+                self._open_position(lots=lots, direction="short", price=current_price)
         elif action == 3:
-            # partial close
+            # Partial close (50% of position)
             if self.position_size != 0 and not self.partial_close_triggered:
                 self._close_partial(current_price)
         elif action == 4:
-            # close full
+            # Close full position
             if self.position_size != 0:
                 self._close_full(current_price)
     
     def _update_equity(self, price):
-        """Update equity based on floating P/L."""
+        """
+        Update the equity based on the current price and any open positions.
+        """
         if self.position_size == 0:
             self.equity = self.current_balance
         else:
             pip_value = self.position_size * (price - self.entry_price)
             self.equity = self.current_balance + pip_value
         
-        # Update daily peak
+        # Update daily and overall peaks
         if self.equity > self.daily_peak_balance:
             self.daily_peak_balance = self.equity
-        
-        # Update overall peak
         if self.equity > self.overall_peak_balance:
             self.overall_peak_balance = self.equity
         
-        # Recompute daily drawdown
+        # Recompute daily drawdown percentage
         self.daily_drawdown_percent = self._calculate_daily_drawdown()
     
     def _open_position(self, lots, direction, price):
+        """
+        Open a new position in the specified direction.
+        """
         if direction == "long":
             self.position_size = lots
         else:
@@ -297,6 +348,9 @@ class GoldTradingEnv(gym.Env):
         self.entry_price = price
     
     def _close_partial(self, current_price):
+        """
+        Close a partial portion (50%) of the current position.
+        """
         closed_size = self.position_size * PARTIAL_CLOSE_RATIO
         remaining_size = self.position_size - closed_size
         
@@ -314,6 +368,9 @@ class GoldTradingEnv(gym.Env):
         self.partial_close_triggered = True
     
     def _close_full(self, current_price):
+        """
+        Fully close the current open position.
+        """
         if self.position_size == 0:
             return
         pip_value = (current_price - self.entry_price)
@@ -340,11 +397,15 @@ class GoldTradingEnv(gym.Env):
         return max(dd, 0.0)
     
     def render(self, mode='human'):
-        pass
+        pass  # Optional: Implement visualization if needed
 
 # -------------------- MAIN SCRIPT ------------------
 def main():
-    # 1) Initialize MT5
+    # Check for GPU availability
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Training using device: {device}")
+
+    # 1) Initialize MT5 connection
     if not initialize_mt5():
         print("Failed to initialize MT5.")
         return
@@ -355,7 +416,7 @@ def main():
         print("No data retrieved, exiting.")
         return
     
-    # Split data into train/test
+    # Split data into training and testing datasets
     split_idx = int(len(df) * 0.8)
     df_train = df.iloc[:split_idx].reset_index(drop=True)
     df_test  = df.iloc[split_idx:].reset_index(drop=True)
@@ -364,38 +425,47 @@ def main():
     train_env = GoldTradingEnv(df_train, initial_balance=INITIAL_BALANCE, verbose=False)
     vec_train_env = DummyVecEnv([lambda: train_env])
     
-    # 4) Train an RL model (PPO)
-    model = PPO("MlpPolicy", vec_train_env, verbose=1, tensorboard_log="./ppo_xauusdm_tensorboard/")
+    # 4) Train the RL model using PPO with enhanced settings and GPU support
+    policy_kwargs = dict(net_arch=[dict(pi=[256, 256], vf=[256, 256])])
+    model = PPO(
+        "MlpPolicy",
+        vec_train_env,
+        verbose=1,
+        tensorboard_log="./ppo_xauusdm_tensorboard/",
+        learning_rate=3e-4,
+        gamma=0.99,
+        policy_kwargs=policy_kwargs,
+        device=device  # Use GPU if available
+    )
     print(f"Starting PPO training for {TOTAL_TRAINING_TIMESTEPS} timesteps...")
     model.learn(total_timesteps=TOTAL_TRAINING_TIMESTEPS)
     print("Training finished!")
     
-    # 5) Test environment (set verbose=True to see logs in console)
+    # 5) Test the trained model (set verbose=True for detailed logs)
     test_env = GoldTradingEnv(df_test, initial_balance=INITIAL_BALANCE, verbose=True)
     obs = test_env.reset()
     
     done = False
     total_reward = 0.0
-    
     while not done:
         action, _ = model.predict(obs)
         obs, reward, done, info = test_env.step(action)
         total_reward += reward
     
-    # Print final results
+    # Print final test results
     print(f"Test completed. Total reward: {total_reward:.2f}")
     print(f"Final balance: {test_env.current_balance:.2f}")
     print(f"Max daily drawdown in test: {test_env.daily_drawdown_percent:.2f}%")
     
-    # Example: Save the trade log to a CSV for analysis
+    # Save trade log to CSV for further analysis
     trade_log_df = pd.DataFrame(test_env.trade_log)
     trade_log_df.to_csv("test_trade_log.csv", index=False)
     print("Saved test trade log to test_trade_log.csv")
     
-    # 6) Save the model
+    # 6) Save the trained model
     model.save("ppo_gold_trader_xauusdm")
     
-    # 7) Shut down MT5
+    # 7) Shut down the MT5 connection
     mt5.shutdown()
 
 if __name__ == "__main__":
