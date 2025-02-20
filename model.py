@@ -28,7 +28,7 @@ except ImportError:
     sys.exit(1)
 
 # ------------- GLOBAL CONFIG -----------------------
-SYMBOL = "XAUUSD"
+SYMBOL = "XAUUSDm"
 INITIAL_BALANCE = 100_000.0
 MAX_DAILY_DRAWDOWN_PERCENT = 4.0
 MAX_OVERALL_DRAWDOWN_PERCENT = 10.0
