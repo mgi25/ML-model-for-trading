@@ -34,7 +34,24 @@ MAX_OVERALL_DRAWDOWN_PERCENT = 10.0
 PARTIAL_CLOSE_RATIO = 0.5
 TRAIN_TIMEFRAMES_DAYS = 365   # 1 year of data
 TOTAL_TRAINING_TIMESTEPS = 500_000
-REWARD_MULTIPLIER = 10.0  # Scale rewards to encourage aggressive profit-taking
+
+# Aggressive strategy parameters:
+RISK_FACTOR = 0.03            # Fraction of balance to risk per trade
+REWARD_MULTIPLIER = 30.0      # Amplify incremental rewards
+DAILY_DRAWDOWN_PENALTY = 0.2  
+OVERALL_DRAWDOWN_PENALTY = 0.5
+MAX_LOT_SIZE = 10.0           # Maximum position size
+
+# New weekly performance bonus parameters:
+# At the end of a week, if the weekly return is between 4% and 5%,
+# add a bonus reward (+1), otherwise apply a penalty (-1).
+TARGET_WEEKLY_LOWER = 0.04  # 4%
+TARGET_WEEKLY_UPPER = 0.05  # 5%
+WEEKLY_BONUS = 1.0
+WEEKLY_PENALTY = -1.0
+
+# Additional bonus for taking non-hold actions (optional)
+TRADE_FREQUENCY_BONUS = 0.1
 
 # ------------- Technical Indicator Functions ---------------------
 def compute_rsi(series, period=14):
@@ -66,11 +83,11 @@ def compute_atr(df, period=14):
     atr = tr.rolling(window=period, min_periods=period).mean()
     return atr.fillna(method='bfill')
 
-def dynamic_lot_size(current_balance, atr_value, risk_factor=0.01, factor=100):
+def dynamic_lot_size(current_balance, atr_value, risk_factor=RISK_FACTOR, factor=100):
     risk_amount = risk_factor * current_balance
     lots = risk_amount / (atr_value * factor)
     lots = max(1.0, lots)
-    lots = min(lots, 5.0)
+    lots = min(lots, MAX_LOT_SIZE)
     return lots
 
 # ------------- STEP 1: CONNECT TO MT5 -----------
@@ -78,7 +95,7 @@ def initialize_mt5(account_id=None, password=None, server=None):
     if not mt5.initialize():
         print("MT5 Initialize() failed. Error code =", mt5.last_error())
         return False
-    # Uncomment below if you need to log in with account details:
+    # Uncomment and configure if a specific account login is needed:
     # if account_id and password and server:
     #     authorized = mt5.login(account_id, password=password, server=server)
     #     if not authorized:
@@ -108,8 +125,23 @@ def download_data(symbol=SYMBOL, timeframe=mt5.TIMEFRAME_M5, start_days=TRAIN_TI
     df.reset_index(drop=True, inplace=True)
     return df
 
-# ------------- STEP 3: CUSTOM GYM ENVIRONMENT ----------
+# ------------- STEP 3: CUSTOM GYM ENVIRONMENT -------------
 class GoldTradingEnv(gym.Env):
+    """
+    A custom Gym environment for RL-based gold trading on XAUUSDM.
+    It now includes a weekly bonus/penalty to encourage a net return of 4-5% per week.
+    
+    Observations (13 features):
+      [open, high, low, close, volume, rsi, macd_hist, atr, position_size,
+       current_balance, daily_drawdown%, overall_peak_balance, partial_close_flag]
+    
+    Actions (discrete):
+      0 = hold
+      1 = open long
+      2 = open short
+      3 = close partial (50%)
+      4 = close full
+    """
     metadata = {'render.modes': ['human']}
     
     def __init__(self, df, initial_balance=INITIAL_BALANCE, verbose=False):
@@ -118,11 +150,13 @@ class GoldTradingEnv(gym.Env):
         self.initial_balance = initial_balance
         self.verbose = verbose
 
+        # Compute technical indicators
         self.df['rsi'] = compute_rsi(self.df['close'], period=14)
         macd_line, signal_line, macd_hist = compute_macd(self.df['close'])
         self.df['macd_hist'] = macd_hist.fillna(0)
         self.df['atr'] = compute_atr(self.df, period=14)
         
+        # Initialize account and environment state
         self.current_step = 0
         self.position_size = 0.0
         self.entry_price = 0.0
@@ -134,6 +168,10 @@ class GoldTradingEnv(gym.Env):
         self.partial_close_triggered = False
         self.trade_log = []
         self.prev_equity = self.equity
+
+        # Track weekly performance (using the 'time' column)
+        self.week_start_time = self.df.iloc[0]["time"]
+        self.week_start_balance = self.current_balance
 
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(13,), dtype=np.float32)
         self.action_space = spaces.Discrete(5)
@@ -159,6 +197,11 @@ class GoldTradingEnv(gym.Env):
         self.partial_close_triggered = False
         self.trade_log = []
         self.prev_equity = self.equity
+        
+        # Reset weekly tracking
+        self.week_start_time = self.df.iloc[0]["time"]
+        self.week_start_balance = self.current_balance
+        
         return self._get_observation()
     
     def step(self, action):
@@ -169,22 +212,43 @@ class GoldTradingEnv(gym.Env):
         
         self._update_equity(current_price)
         self._execute_action(action, current_price)
-
         self.current_step += 1
+
         done = self.current_step >= len(self.df) - 1
         if not done:
             next_price = self.df.iloc[self.current_step].close
             self._update_equity(next_price)
         
+        # Base reward: scaled incremental equity change
         reward = ((self.equity - self.prev_equity) / self.initial_balance) * REWARD_MULTIPLIER
         self.prev_equity = self.equity
 
+        # Bonus for taking a trade (non-hold action)
+        if action != 0:
+            reward += TRADE_FREQUENCY_BONUS
+
+        # Check for week boundary and apply bonus/penalty
+        current_time = self.df.iloc[self.current_step]["time"]
+        # Compare ISO week (year and week number)
+        if (current_time.isocalendar().year != self.week_start_time.isocalendar().year or
+            current_time.isocalendar().week != self.week_start_time.isocalendar().week):
+            # End of the week reached
+            weekly_return = (self.current_balance - self.week_start_balance) / self.week_start_balance
+            if TARGET_WEEKLY_LOWER <= weekly_return <= TARGET_WEEKLY_UPPER:
+                reward += WEEKLY_BONUS
+            else:
+                reward += WEEKLY_PENALTY
+            # Reset weekly tracking for the new week
+            self.week_start_time = current_time
+            self.week_start_balance = self.current_balance
+
+        # Apply drawdown penalties
         if self._calculate_daily_drawdown() > MAX_DAILY_DRAWDOWN_PERCENT:
-            reward -= 1.0
+            reward -= DAILY_DRAWDOWN_PENALTY
             done = True
         
         if self._calculate_overall_drawdown() > MAX_OVERALL_DRAWDOWN_PERCENT:
-            reward -= 2.0
+            reward -= OVERALL_DRAWDOWN_PENALTY
             done = True
 
         step_log = {
@@ -207,12 +271,11 @@ class GoldTradingEnv(gym.Env):
             print(f"[Step {self.current_step}] Action={action}, Price={current_price:.2f}, "
                   f"Equity={self.equity:.2f}, Reward={reward:.4f}, PosSize={self.position_size}")
 
-        obs = self._get_observation()
-        return obs, reward, done, {}
+        return self._get_observation(), reward, done, {}
     
     def _execute_action(self, action, current_price):
         if action == 0:
-            pass
+            pass  # Hold
         elif action == 1:
             if self.position_size == 0:
                 atr_value = self.df.iloc[self.current_step].atr
@@ -250,7 +313,6 @@ class GoldTradingEnv(gym.Env):
     def _close_partial(self, current_price):
         closed_size = self.position_size * PARTIAL_CLOSE_RATIO
         remaining_size = self.position_size - closed_size
-        
         pip_value = (current_price - self.entry_price) if self.position_size >= 0 else (self.entry_price - current_price)
         realized_pnl = pip_value * closed_size
         self.current_balance += realized_pnl
@@ -282,13 +344,7 @@ class GoldTradingEnv(gym.Env):
 
 # -------------------- MAIN SCRIPT ------------------
 def main():
-    # Check for GPU availability
-    if torch.cuda.is_available():
-        device = "cuda"
-    else:
-        device = "cpu"
-        print("WARNING: CUDA not available. Make sure you have installed the CUDA-enabled version of PyTorch.")
-    
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Training using device: {device}")
     print("Torch CUDA availability:", torch.cuda.is_available())
 
@@ -308,13 +364,13 @@ def main():
     train_env = GoldTradingEnv(df_train, initial_balance=INITIAL_BALANCE, verbose=False)
     vec_train_env = DummyVecEnv([lambda: train_env])
     
-    policy_kwargs = dict(net_arch=[dict(pi=[256, 256], vf=[256, 256])])
+    policy_kwargs = dict(net_arch=[dict(pi=[256,256,256], vf=[256,256,256])])
     model = PPO(
         "MlpPolicy",
         vec_train_env,
         verbose=1,
         tensorboard_log="./ppo_xauusdm_tensorboard/",
-        learning_rate=3e-4,
+        learning_rate=1e-4,
         gamma=0.99,
         policy_kwargs=policy_kwargs,
         device=device
